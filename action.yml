@@ -1,0 +1,92 @@
+name: Prepare Tauri signing key
+description: >-
+  Normalize the updater signing key (two-line minisign file, its base64, or the
+  bare base64 key line) and export TAURI_SIGNING_PRIVATE_KEY (and its password)
+  to GITHUB_ENV for the Tauri CLI.
+inputs:
+  private-key:
+    description: TAURI_SIGNING_PRIVATE_KEY secret
+    required: true
+  password:
+    description: TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Prepare Tauri signing key
+      shell: bash
+      env:
+        RAW: ${{ inputs.private-key }}
+        KEY_PASSWORD: ${{ inputs.password }}
+      run: |
+        # Normalize the updater signing secret from a minisign key file, a
+        # base64-encoded version of the file, or a bare base64 key line.
+        RAW=$(printf '%s' "$RAW" | tr -d '\r')
+        RAW="${RAW#"${RAW%%[![:space:]]*}"}"
+        RAW="${RAW%"${RAW##*[![:space:]]}"}"
+
+        if [ -z "$RAW" ]; then
+          echo "❌ TAURI_SIGNING_PRIVATE_KEY Secret is empty or missing" >&2
+          echo "Check GitHub repository Settings > Secrets and variables > Actions" >&2
+          exit 1
+        fi
+
+        KEY_PATH="${RUNNER_TEMP:-/tmp}/tauri_signing.key"
+        mkdir -p "$(dirname "$KEY_PATH")"
+
+        # Case 1: bare minisign key text (two lines, first line starts with
+        # "untrusted comment:")
+        if printf '%s' "$RAW" | grep -q '^untrusted comment:'; then
+          printf '%s\n' "$RAW" > "$KEY_PATH"
+          echo "✅ Using raw minisign key content"
+        else
+          # Case 2: the secret is itself base64-encoded minisign key text.
+          if DECODED=$(printf '%s' "$RAW" | (base64 --decode 2>/dev/null || base64 -D 2>/dev/null)); then
+            if printf '%s' "$DECODED" | grep -q '^untrusted comment:'; then
+              printf '%s\n' "$DECODED" > "$KEY_PATH"
+              echo "✅ Decoded base64-wrapped minisign key"
+            else
+              # Case 3: the secret is just the second/base64 key line.
+              if printf '%s' "$RAW" | grep -Eq '^[A-Za-z0-9+/]+={0,2}$'; then
+                ONE=$(printf '%s' "$RAW" | tr -d '\r\n')
+                printf '%s\n%s\n' "untrusted comment: tauri signing key" "$ONE" > "$KEY_PATH"
+                echo "✅ Constructed minisign key file from single base64 key line"
+              else
+                echo "❌ TAURI_SIGNING_PRIVATE_KEY format is not recognized: not a minisign key, not base64-wrapped minisign key, and not a plain base64 key" >&2
+                echo "Key prefix: $(printf '%s' "$RAW" | head -c 10)..." >&2
+                exit 1
+              fi
+            fi
+          else
+            # Case 3 fallback for keys that are base64 but without line breaks.
+            if printf '%s' "$RAW" | grep -Eq '^[A-Za-z0-9+/]+={0,2}$'; then
+              ONE=$(printf '%s' "$RAW" | tr -d '\r\n')
+              printf '%s\n%s\n' "untrusted comment: tauri signing key" "$ONE" > "$KEY_PATH"
+              echo "✅ Constructed minisign key file from single base64 key line"
+            else
+              echo "❌ TAURI_SIGNING_PRIVATE_KEY format is not recognized: not a minisign key, not base64-wrapped minisign key, and not a plain base64 key" >&2
+              echo "Key prefix: $(printf '%s' "$RAW" | head -c 10)..." >&2
+              exit 1
+            fi
+          fi
+        fi
+
+        if command -v base64 >/dev/null 2>&1; then
+          KEY_B64=$(base64 < "$KEY_PATH" | tr -d '\r\n')
+        elif command -v openssl >/dev/null 2>&1; then
+          KEY_B64=$(openssl base64 -A -in "$KEY_PATH")
+        else
+          KEY_B64=$(KEY_PATH="$KEY_PATH" node -e "process.stdout.write(require('fs').readFileSync(process.env.KEY_PATH).toString('base64'))")
+        fi
+
+        if [ -z "$KEY_B64" ]; then
+          echo "❌ Unable to generate base64 private key content" >&2
+          exit 1
+        fi
+
+        printf '%s\n' "TAURI_SIGNING_PRIVATE_KEY=$KEY_B64" >> "$GITHUB_ENV"
+        if [ -n "$KEY_PASSWORD" ]; then
+          printf '%s\n' "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+        fi
+        echo "✅ Tauri signing key prepared"
